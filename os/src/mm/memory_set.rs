@@ -7,6 +7,7 @@ use super::{StepByOne, VPNRange};
 use crate::config::{
     KERNEL_STACK_SIZE, MEMORY_END, PAGE_SIZE, TRAMPOLINE, TRAP_CONTEXT_BASE, USER_STACK_SIZE,
 };
+
 use crate::sync::UPSafeCell;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
@@ -39,6 +40,8 @@ pub struct MemorySet {
     areas: Vec<MapArea>,
 }
 
+use crate::mm::frame_allocator::allocable_pages;
+
 impl MemorySet {
     /// Create a new empty `MemorySet`.
     pub fn new_bare() -> Self {
@@ -63,6 +66,58 @@ impl MemorySet {
             None,
         );
     }
+    /// Remove a area of memory.
+    pub fn remove_framed_area(&mut self, start_va: VirtAddr, end_va: VirtAddr) -> isize {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+
+        // 查找完全匹配的区域
+        for (id, area) in self.areas.iter_mut().enumerate() {
+            if area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn {
+                // 找到匹配的区域，移除它
+                let mut removed_area = self.areas.remove(id);
+                removed_area.unmap(&mut self.page_table);
+                //println!("remove area from {} to {}", start_vpn.0, end_vpn.0);
+                return 0;
+            }
+        }
+        println!("no matching area found to remove");
+        -1 // 没找到匹配的区域
+    }
+
+    /// check if the area is conflict
+    pub fn check_area_conflict(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        for area in self.areas.iter() {
+            if start_vpn < area.vpn_range.get_end() && end_vpn > area.vpn_range.get_start() {
+                //println!("conflict at start_vpn: {}, end_vpn: {}",start_vpn.0, end_vpn.0);
+                return true; // 有重叠，冲突
+            }
+        }
+        false // 没有重叠
+    }
+
+    /// return -1 area conflict, 0 success
+    pub fn safe_insert_framed_area(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> isize {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if self.check_area_conflict(start_vpn, end_vpn) {
+            println!("memory area conflict!");
+            return -1;
+        }
+        let pages = end_vpn.0 - start_vpn.0;
+        if pages > allocable_pages() {
+            println!("pages exceed allocable pages!");
+            return -1;
+        }
+        self.insert_framed_area(start_va, end_va, permission);
+        return 0;
+    }
+
     fn push(&mut self, mut map_area: MapArea, data: Option<&[u8]>) {
         map_area.map(&mut self.page_table);
         if let Some(data) = data {

@@ -14,9 +14,12 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL;
 use crate::loader::{get_app_data, get_num_app};
+use crate::mm::{translated_byte_buffer, MapPermission, VirtAddr};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
+use alloc::vec;
 use alloc::vec::Vec;
 use lazy_static::*;
 use switch::__switch;
@@ -46,6 +49,8 @@ struct TaskManagerInner {
     tasks: Vec<TaskControlBlock>,
     /// id of current `Running` task
     current_task: usize,
+    /// syscall info
+    syscall_info: Vec<[usize; MAX_SYSCALL]>,
 }
 
 lazy_static! {
@@ -58,12 +63,14 @@ lazy_static! {
         for i in 0..num_app {
             tasks.push(TaskControlBlock::new(get_app_data(i), i));
         }
+        let syscall_info = vec![[0_usize; MAX_SYSCALL]; num_app];
         TaskManager {
             num_app,
             inner: unsafe {
                 UPSafeCell::new(TaskManagerInner {
                     tasks,
                     current_task: 0,
+                    syscall_info: syscall_info,
                 })
             },
         }
@@ -153,6 +160,22 @@ impl TaskManager {
             panic!("All applications completed!");
         }
     }
+    fn get_syscall_info(&self, syscall_id: usize) -> isize {
+        if syscall_id < MAX_SYSCALL {
+            let inner = self.inner.exclusive_access();
+            let current = inner.current_task;
+            return inner.syscall_info[current][syscall_id] as isize;
+        }
+        -1
+    }
+
+    fn syscall_counts(&self, syscall_id: usize) {
+        if syscall_id < MAX_SYSCALL {
+            let mut inner = self.inner.exclusive_access();
+            let current = inner.current_task;
+            inner.syscall_info[current][syscall_id] += 1;
+        }
+    }
 }
 
 /// Run the first task in task list.
@@ -201,4 +224,94 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// read data from user space to kernel space
+pub fn read_buffer_from_va(va: usize, va_len: usize, read_buffer: &mut [u8]) -> bool {
+    // 检测非法地址
+    if va > ((1 << 39) - 1) {
+        println!("read_buffer_from_va: va is illegal");
+        return false;
+    }
+
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    let user_token = inner.tasks[current].get_user_token();
+
+    let vpn = VirtAddr::from(va).floor();
+
+    if let Some(pte) = inner.tasks[current].memory_set.translate(vpn) {
+        if !pte.is_valid() || !pte.readable() {
+            println!("pte is not readable or not valid");
+            return false;
+        }
+    } else {
+        println!("pte is not found");
+        return false;
+    }
+    let read_len = read_buffer.len();
+    let mut total_read = 0;
+    let buffers = translated_byte_buffer(user_token, va as *const u8, va_len);
+    for buffer in buffers {
+        let to_read = core::cmp::min(buffer.len(), read_len - total_read);
+        read_buffer[..to_read].copy_from_slice(&buffer[total_read..total_read + to_read]);
+        total_read += to_read;
+    }
+
+    return total_read == va_len;
+}
+
+/// write data from kernel space to user space
+pub fn write_buffer_to_va(va: usize, va_len: usize, write_buffer: &[u8]) -> bool {
+    let inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    let user_token = inner.tasks[current].get_user_token();
+    let vpn = VirtAddr::from(va).floor();
+    if let Some(pte) = inner.tasks[current].memory_set.translate(vpn) {
+        if !pte.is_valid() || !pte.writable() {
+            println!("pte is not writable or not valid");
+            return false;
+        }
+    } else {
+        println!("pte is not exist");
+        return false;
+    }
+
+    let write_len = write_buffer.len();
+    let mut total_write = 0;
+    let buffers = translated_byte_buffer(user_token, va as *const u8, va_len);
+    for buffer in buffers {
+        let to_write = core::cmp::min(buffer.len(), write_len - total_write);
+        buffer[..to_write].copy_from_slice(&write_buffer[total_write..total_write + to_write]);
+        total_write += to_write;
+    }
+    return total_write == va_len;
+}
+
+/// count syscall current task
+pub fn syscall_counts(syscall_id: usize) {
+    TASK_MANAGER.syscall_counts(syscall_id);
+}
+
+/// get syscall info current task
+pub fn get_syscall_info(syscall_id: usize) -> isize {
+    TASK_MANAGER.get_syscall_info(syscall_id)
+}
+
+/// mmap current task
+pub fn current_task_mmap(start_va: VirtAddr, end_va: VirtAddr, permission: MapPermission) -> isize {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+
+    inner.tasks[current]
+        .memory_set
+        .safe_insert_framed_area(start_va, end_va, permission)
+}
+/// unmap current task
+pub fn current_task_munmap(start_va: VirtAddr, end_va: VirtAddr) -> isize {
+    let mut inner = TASK_MANAGER.inner.exclusive_access();
+    let current = inner.current_task;
+    inner.tasks[current]
+        .memory_set
+        .remove_framed_area(start_va, end_va)
 }

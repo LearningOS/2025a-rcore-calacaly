@@ -40,6 +40,7 @@ impl Drop for FrameTracker {
 
 trait FrameAllocator {
     fn new() -> Self;
+    fn pages(&self) -> usize;
     fn alloc(&mut self) -> Option<PhysPageNum>;
     fn dealloc(&mut self, ppn: PhysPageNum);
 }
@@ -84,6 +85,9 @@ impl FrameAllocator for StackFrameAllocator {
         // recycle
         self.recycled.push(ppn);
     }
+    fn pages(&self) -> usize {
+        self.end - self.current + self.recycled.len()
+    }
 }
 
 type FrameAllocatorImpl = StackFrameAllocator;
@@ -115,6 +119,11 @@ pub fn frame_alloc() -> Option<FrameTracker> {
 /// Deallocate a physical page frame with a given ppn
 pub fn frame_dealloc(ppn: PhysPageNum) {
     FRAME_ALLOCATOR.exclusive_access().dealloc(ppn);
+}
+
+/// Return the number of allocable pages
+pub fn allocable_pages() -> usize {
+    FRAME_ALLOCATOR.exclusive_access().pages()
 }
 
 #[allow(unused)]
